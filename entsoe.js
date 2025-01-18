@@ -15,6 +15,9 @@ var BASE_URL            = "https://web-api.tp.entsoe.eu/api?"
 /*
  * A.9. DocumentType:
  * https://transparency.entsoe.eu/content/static_content/Static%20content/web%20api/Guide.html#_documenttype
+ *
+ * For new version of docummentation (since 2025-01-01)
+ * GET request to price is described in section 'GET 12.1.D Energy Prices'
 */
 var DOCUMENT_TYPE    = "A44"
 
@@ -30,7 +33,15 @@ class Entsoe {
 	this.rounding_precision = rounding_precision;
 	this.user_time_begin = null;
 	this.user_time_end   = null;
-
+	this.property = {};				// This variable will be contain:
+							// {
+  							//      "yyyy-mm-dd": {
+    							//          "currency": "EUR",
+    							//          "unit": "MWH",
+    							//	    "resolution": "PT60M"
+  							//      },
+							//  ...
+							// }
 
 	if (this.config.country[country]) {
     	    this.area = this.config.country[country];
@@ -39,10 +50,94 @@ class Entsoe {
 	    console.info("Selected country   :", country);
 	    console.info("Tax for electricity: %d%", this.tax);
 	} else {
-	    var err_msg = "This country '" + country + "' is not presented in Entsoe";
+	    var err_msg = "This country '" + country + "' is not presented in Entsoe\n";
+		err_msg += "Try to find your country here: https://www.entsoe.eu/data/energy-identification-codes-eic/eic-approved-codes/";
 	    throw new Error(err_msg);
 	}
-    }
+    }  // end constructor
+
+
+/*
+ * Get Spot price and average for selected period
+ * [intput]
+ *	@user_period_start - start Date;
+ *	@user_period_end   - end Date;
+ *	@fill_missing_values - for Period -> resolution -> PT60 
+ *			       should be 24 value (time/price) for 24 hour [00.00 ... 23.00]
+ *			     == 1 use software calculation to restore missing valu
+ *			     == 0 provide [hourly_cost, avg] with missing value
+ * [output]
+ *	[hourly_cost, avg]
+*/
+    getSpotAndAvgPrices(user_period_start, user_period_end, fill_missing_values=1) {
+	var total_sum = 0;
+	var total_count = 0;
+
+	if ( this.validate_time_arguments(user_period_start, user_period_end) ) {
+		var period_start = new Date(user_period_start);
+		var period_end   = new Date(user_period_end);
+	} else {
+		return [null, null];
+	}
+
+
+	var [hourly_cost, qitem] = this.getSpotPrices(period_start, period_end);
+
+	if (hourly_cost == null) {
+		return [null, null];
+	}
+
+	var total_items = 24 * Math.ceil((user_period_end.getTime() - user_period_start.getTime()) / (1000 * 3600 * 24));
+
+	if ( qitem != total_items && fill_missing_values == 1 ) {
+		console.warn(`To calculate avg need ${total_items} items; Entsoe send ${qitem} items`);
+		hourly_cost = this.fillEmptyHours(hourly_cost);
+	}
+
+	for (var current_day in hourly_cost) {
+	    for (var index in hourly_cost[current_day]) {
+		total_sum += hourly_cost[current_day][index]["price"];
+	    }
+	    total_count += hourly_cost[current_day].length;
+	}
+
+	console.info("[entsoe.js] -> Avg price is: ", (total_sum/total_count).toFixed(this.rounding_precision));
+
+	this.user_time_begin = null;
+        this.user_time_end   = null;
+        this.property = {};
+
+	return [hourly_cost, total_sum/total_count];
+    }   // end func [getSpotAndAvgPrices]
+
+
+/*
+ * Check that user input of date is correct
+*/
+    validate_time_arguments(user_period_start, user_period_end) {
+	if ( !(user_period_start instanceof Date) ) {
+		console.error("[entsoe.js] -> 'Start period' is not a Date object: ", user_period_start);
+		return false;
+	}
+
+	if ( !(user_period_end instanceof Date) ) {
+		console.error("[entsoe.js] -> 'End period' is not a Date object: ", user_period_end);
+		return false;
+	}
+
+	if (user_period_end < user_period_start) {
+        	console.error("'period End' [%s] can't be before 'period Start' [%s]",
+				user_period_end.toLocaleDateString() + " " + user_period_end.toLocaleTimeString(),
+				user_period_start.toLocaleDateString() + " " + user_period_start.toLocaleTimeString())
+		return false;
+    	} else {
+		this.user_time_begin = new Date(user_period_start);
+		this.user_time_end   = new Date(user_period_end);
+		console.info("User period start: ", this.user_time_begin);
+		console.info("     period end:   ", this.user_time_end);
+		return true;
+	}
+    }  // end func [validate_time_argiment]
 
 /*
  * [Input]
@@ -68,58 +163,52 @@ class Entsoe {
 	var hourly_cost = null;
 	var entsoe_time_interval = null;
 
-	var period_start = new Date(user_period_start);
-	var period_end   = new Date(user_period_end);
+	if (this.user_time_begin == null && this.user_time_end == null) {
 
-	entsoe_time_interval = this.prepare_time_for_request(period_start, period_end);
+		if ( this.validate_time_arguments(user_period_start, user_period_end) ) {
+			var period_start = new Date(user_period_start);
+			var period_end   = new Date(user_period_end);
+		} else {
+			return [null, null];
+		}
+	} else {
+		var period_start = new Date(user_period_start);
+                var period_end   = new Date(user_period_end);
+	}
 
-	if (entsoe_time_interval) {
-	    response = this.http_get_request(entsoe_time_interval[0], entsoe_time_interval[1]);
+	/*
+	 * Subtract 24 hours to get price for period [00.00 - 01.00] of requested interval
+	 * This happen because entsoe api return price for period [1 ... 24], where
+	 *   (1) - it is relevant for current day [1.00 ... 2.00]
+	 *   (24) - it is relevant for (current day + 1) [0.00 ... 1.00]
+         */
+	period_start.setDate(period_start.getDate() - 1);
 
-	    if ( response ) {
+	entsoe_time_interval = [this.transform_date_to_entsoe_format(period_start),
+		                this.transform_date_to_entsoe_format(period_end)];
+
+	response = this.http_get_request(entsoe_time_interval[0], entsoe_time_interval[1]);
+
+	if ( response ) {
 		hourly_cost = this.parse_entsoe_response(response);
-
-	    } else {
+	} else {
 		console.warn("[entsoe.js]-> There is no response from Entsoe");
 		return [null, null];
-	    }
+	}
 
+	if (hourly_cost !== null) {
+	    console.info("getSpotPrice completed successfully. Price data has been successfully retrieved");
+	    return [this.group_by_days(hourly_cost), Object.keys(hourly_cost).length];
 	} else {
+	    console.error("Can't receive prices from Entsoe");
 	    return [null, null];
-	} // close 'if (entsoe_time_interval)'
-
-	console.info("getSpotPrice completed successfully. Price data has been successfully retrieved");
-	return [this.group_by_days(hourly_cost), Object.keys(hourly_cost).length];
-
-   }	// end function getSpotPrice
-
-    getAveragePrice(user_period_start, user_period_end) {
-	var total_sum = 0;
-	var total_count = 0;
-
-	var [hourly_cost, qitem] = this.getSpotPrices(user_period_start, user_period_end);
-
-	var total_days = 24 * Math.floor((user_period_end.getTime() - user_period_start.getTime()) / (1000 * 3600 * 24));
-
-	if ( qitem != total_days ) {
-		console.warn(`To calculate avg need ${total_days} items; Entsoe send ${qitem} items`);
-		var filled_price = this.fillEmptyHours(hourly_cost);
 	}
+   }	// end func [getSpotPrice]
 
-	for (var current_day in filled_price) {
-	    for (var index in filled_price[current_day]) {
-		total_sum += filled_price[current_day][index]["price"];
-	    }
-	    total_count += filled_price[current_day].length;
-	}
-
-	console.info("Avg price is: ", (total_sum/total_count).toFixed(this.rounding_precision));
-	return total_sum/total_count;
-    }   // end function getAveragePrice
 
 /*
- * For some date Entsoe may return not 24 item "time/price" for 24 hours
- * I.e. mean that for some hour the combination "time/price" will be missed.
+ * For some date Entsoe may return not 24 item "time/price" for 24 hours (resolution PT60M)
+ * I.e. it mean that for some hour the combination "time/price" will be missed.
  * Usually it happen when the same price presented on next hour.
  * So, if we received @user_period where missed for example item "time/price" for "03:00" hour
  * the missing value will be restored from previous hour or if missed value for "00:00"
@@ -145,48 +234,8 @@ class Entsoe {
         } // close for (current_day in user_period) {
 
 	return user_period;
-    }   // end function fill_empty_hours
+    }   // end func [fill_empty_hours]
 
-    prepare_time_for_request(raw_start, raw_end) {
-    	var entsoe_time = null;
-    	var period_start = null;
-    	var period_stop = null;
-
-	if ( !(raw_start instanceof Date) ) {
-		console.error("[entsoe.js] -> 'Start period' is not a Date object: ", raw_start);
-		return null;
-	}
-
-	if ( !(raw_end instanceof Date) ) {
-		console.error("[entsoe.js] -> 'End period' is not a Date object: ", raw_end);
-		return null;
-	}
-
-	if (raw_end < raw_start) {
-        	console.error("'period End' [%s] can't be before 'period Start' [%s]",
-				raw_end.toLocaleDateString() + " " + raw_end.toLocaleTimeString(),
-				raw_start.toLocaleDateString() + " " + raw_start.toLocaleTimeString())
-		return null;
-    	} else {
-		this.user_time_begin = new Date(raw_start);
-		this.user_time_end   = new Date(raw_end);
-		console.info("User period start: ", this.user_time_begin);
-		console.info("     period end:   ", this.user_time_end);
-	}
-
-	/*
-	 * Subtract 24 hours to get price for period [00.00 - 01.00] of requested interval
-	 * This happen because entsoe api return price for period [1 ... 24], where
-	 *   (1) - it is relevant for current day [1.00 ... 2.00]
-	 *   (24) - it is relevant for (current day + 1) [0.00 ... 1.00]
-         */
-	raw_start.setDate(raw_start.getDate() - 1);
-
-	entsoe_time = [this.transform_date_to_entsoe_format(raw_start),
-		       this.transform_date_to_entsoe_format(raw_end)];
-
-	return entsoe_time;
-    }   // end function 'prepare_time_for_request'
 
 /*
  * Transform object type 'Date' to string with specific format: "yyyyMMddHHmm"
@@ -217,7 +266,8 @@ class Entsoe {
 	raw_xml = HTTP.sendHttpGetRequest(url_request, TIMEOUT);
 
 	return raw_xml;
-   }    // end function http_get_request
+   }    // end func [http_get_request]
+
 
    parse_entsoe_response(raw_xml_response) {
 	var json_response = [];
@@ -282,13 +332,14 @@ class Entsoe {
        }
 
        return electricity_time_period;
-   }   // end function 'parse_entsoe_response'
+   }   // end func [parse_entsoe_response]
+
 
    parse_entsoe_raw_timeseries(raw_ts){
 	var price_watt = null;
 	var price_by_hour = {};
 
-        if (raw_ts['currency_Unit.name']['#'] != "EUR") {
+/*        if (raw_ts['currency_Unit.name']['#'] != "EUR") {
                  console.warn("Current version doesn't support received currency: ", raw_ts['currency_Unit.name']['#']);
                  return null;
         }
@@ -302,7 +353,7 @@ class Entsoe {
 		console.warn("Current version doesn't support following period interval: ", raw_ts['Period']['resolution']['#']);
 		return null;
 	}
-
+*/
 	/*
 	* Usually in raw_ts Period -> timeInterval -> start = "2024-04-15T22:00Z",
 	* 		    Period -> timeInterval -> end   = "2024-04-16T22:00Z"
@@ -328,6 +379,14 @@ class Entsoe {
 		if ( entsoe_day_hour.getTime() >= this.user_time_begin.getTime() &&
 		     entsoe_day_hour.getTime() <= this.user_time_end.getTime() ) {
 
+		    var property_date = this.formatTimestamp(entsoe_day_hour);
+
+                    if (!this.property[property_date.split(" ")[0]]) {
+                          this.property[property_date.split(" ")[0]] = {"currency":   raw_ts['currency_Unit.name']['#'],
+                                      		       			"unit":       raw_ts['price_Measure_Unit.name']['#'],
+                                                       			"resolution": raw_ts['Period']['resolution']['#']};
+                    }
+
 		    if (this.cnt_kWh) {
 			price_watt = ((entsoe_points[index]['price.amount']['#']/10)*(1 + this.tax/100)).toFixed(this.rounding_precision);
 		    } else {
@@ -338,7 +397,8 @@ class Entsoe {
 	} // close for (var index=0; index < entsoe_points.lengt; index++)
 
 	return price_by_hour;
-   }    // end function parse_entsoe_raw_timeseries(raw_ts)
+   }    // end func [parse_entsoe_raw_timeseries(raw_ts)]
+
 
     formatTimestamp(date) {
 	var year  = date.getFullYear();
@@ -359,7 +419,7 @@ class Entsoe {
  *
  * Return
  *	{
- *	 "2024-12-26": [
+ *	 "yyyy-mm-dd": [
  *    		{
  *		  "time": "00:00",
  *     		  "price": 0.5
@@ -367,7 +427,9 @@ class Entsoe {
  *   		{
  *     		  "time": "01:00",
  *     		  "price": 0.32
- *   		}]
+ *   		},
+ *		...
+ *		]
  *	}
 */
     group_by_days(user_period) {
@@ -384,8 +446,7 @@ class Entsoe {
 	}
 
 	return entose_days;
-    }   // end function group_by_days
-
+    }   // end func [group_by_days]
 
 
 }       // close 'Entsoe' class
